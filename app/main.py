@@ -9,14 +9,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .collector import Collector, ScanBusy
 from .config import Settings, settings
-from .db import Database
+from .db import Database, RevocationError
+from .revocation import RevocationService
 from .store import Store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,6 +42,9 @@ def _message_view(db: Database, row) -> dict[str, Any]:
     except json.JSONDecodeError:
         item["report_nos_list"] = []
     item["reports"] = [dict(r) for r in db.reports_for_message(item["id"])]
+    revocation = db.get_revocation(item["id"])
+    item["revocation"] = dict(revocation) if revocation is not None else None
+    item["revoked"] = revocation is not None
     return item
 
 
@@ -49,6 +53,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     db = Database(cfg.database_path)
     store = Store(cfg.storage_dir)
     collector = Collector(cfg, db, store)
+    revocations = RevocationService(db=db, cfg=cfg)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -106,6 +111,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     app.state.db = db
     app.state.store = store
     app.state.collector = collector
+    app.state.revocations = revocations
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
     # ------------------------------------------------------------------ pages
@@ -113,7 +119,7 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
     def dashboard(request: Request):
         mark_filter = request.query_params.get("mark") or None
         messages = [_message_view(db, row) for row in db.list_messages(100, mark_filter)]
-        reports = [dict(r) for r in db.list_reports(200)]
+        reports = revocations.report_views(200)
         state = db.get_state(cfg.account, cfg.imap_mailbox)
         return templates.TemplateResponse(
             request,
@@ -160,6 +166,54 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             log.exception("retry marks failed")
             return RedirectResponse(f"/?flash=&error={_q(str(exc))}", status_code=303)
         return RedirectResponse(f"/?flash={_q(f'补标记完成：{marked} 封')}", status_code=303)
+
+    # ------------------------------------------------------------- revocation
+    @app.get("/revocations", response_class=HTMLResponse)
+    def revocations_page(request: Request):
+        # Only received mail can have its supply authorization revoked.
+        messages = [
+            _message_view(db, row)
+            for row in db.list_messages(200, decision="accepted")
+        ]
+        reports = revocations.report_views(200)
+        records = [dict(r) for r in db.list_revocations(200)]
+        return templates.TemplateResponse(
+            request,
+            "revocations.html",
+            {
+                "cfg": cfg,
+                "stats": db.stats(),
+                "messages": messages,
+                "reports": reports,
+                "records": records,
+                "flash": request.query_params.get("flash", ""),
+                "error": request.query_params.get("error", ""),
+            },
+        )
+
+    @app.post("/actions/revoke")
+    async def action_revoke(message_id: int = Form(...), reason: str = Form(...)):
+        try:
+            result = await asyncio.to_thread(revocations.revoke, message_id, reason, "web")
+        except RevocationError as exc:
+            log.info("revocation rejected: %s", exc)
+            return RedirectResponse(
+                f"/revocations?flash=&error={_q(str(exc))}", status_code=303
+            )
+        except Exception as exc:  # pragma: no cover - surfaced in the UI
+            log.exception("revocation failed")
+            return RedirectResponse(
+                f"/revocations?flash=&error={_q(f'撤销失败：{exc}')}", status_code=303
+            )
+        if result["status"] == "already":
+            return RedirectResponse(
+                f"/revocations?flash={_q('该邮件已撤销，重复提交未产生新记录')}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            f"/revocations?flash={_q(f'已撤销邮件 #{message_id} 的供数授权（原因：{reason.strip()}）')}",
+            status_code=303,
+        )
 
     # -------------------------------------------------------------------- API
     @app.get("/healthz")
@@ -250,6 +304,15 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
         row = db.get_report(report_id)
         if row is None:
             raise HTTPException(status_code=404, detail="report not found")
+        # New downloads are authorized from committed state at request time.
+        # A report whose only sources have been revoked is unavailable even
+        # though the archived bytes and its history are retained.
+        availability = db.report_availability(report_id)
+        if availability is None or not availability["available"]:
+            raise HTTPException(
+                status_code=403,
+                detail="报告当前无有效来源（交付邮件的供数授权已撤销），下载被拒绝",
+            )
         path = store.absolute(row["attachment_path"])
         if not path.is_file():
             raise HTTPException(status_code=410, detail="附件文件缺失")
@@ -258,6 +321,34 @@ def create_app(cfg: Settings | None = None) -> FastAPI:
             media_type="text/csv; charset=utf-8",
             filename=row["attachment_name"],
         )
+
+    @app.get("/api/reports/{report_id}")
+    def api_report(report_id: int):
+        view = revocations.report_view(report_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="report not found")
+        return view
+
+    @app.get("/api/reports")
+    def api_reports():
+        return revocations.report_views(200)
+
+    @app.get("/api/revocations")
+    def api_revocations():
+        return [dict(r) for r in db.list_revocations(200)]
+
+    @app.post("/api/messages/{message_id}/revoke")
+    async def api_revoke(message_id: int, payload: dict[str, Any] | None = None):
+        payload = payload or {}
+        reason = str(payload.get("reason", "")).strip()
+        revoked_by = str(payload.get("revoked_by", "api")).strip() or "api"
+        try:
+            result = await asyncio.to_thread(
+                revocations.revoke, message_id, reason, revoked_by
+            )
+        except RevocationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return result
 
     @app.exception_handler(Exception)
     async def unhandled(request: Request, exc: Exception):

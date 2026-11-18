@@ -8,9 +8,11 @@
   <div class="card"><span>收讫</span><strong>{{ stats.accepted }}</strong></div>
   <div class="card"><span>拒收</span><strong>{{ stats.rejected }}</strong></div>
   <div class="card"><span>已入库报告</span><strong>{{ stats.reports }}</strong></div>
+  <div class="card warn"><span>不可用报告</span><strong>{{ stats.unavailable_reports }}</strong></div>
   <div class="card warn"><span>待标记</span><strong>{{ stats.pending_marks }}</strong></div>
   <div class="card"><span>已标记</span><strong>{{ stats.marked }}</strong></div>
   <div class="card"><span>旧代失效标记</span><strong>{{ stats.stale_marks }}</strong></div>
+  <div class="card warn"><span>来源撤销</span><strong>{{ stats.revocations }}</strong></div>
 </section>
 
 <section class="panel">
@@ -54,6 +56,7 @@
         <td>
           {% if m.decision == "accepted" %}
             <span class="badge ok">收讫</span>
+            {% if m.revoked %}<span class="badge bad">已撤销</span>{% endif %}
           {% else %}
             <span class="badge bad">拒收</span>
             <div class="reason">{{ m.reason }}</div>
@@ -88,22 +91,48 @@
 <section class="panel">
   <h2>入仓报告</h2>
   <table>
-    <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th><th>原件 SHA-256</th><th>附件</th></tr></thead>
+    <thead><tr><th>报告号</th><th>样本号</th><th>项目</th><th>测值</th><th>原件 SHA-256</th><th>供数状态 / 实际可用来源</th><th>附件</th></tr></thead>
     <tbody>
     {% for r in reports %}
-      <tr>
+      <tr class="{{ 'row-bad' if not r.available else '' }}">
         <td><code>{{ r.report_no }}</code></td>
         <td>{{ r.sample_no }}</td>
         <td>{{ r.item }}</td>
         <td>{{ r.value }}</td>
         <td class="mono">{{ r.attachment_sha256[:16] }}…</td>
-        <td><a href="/api/reports/{{ r.id }}/attachment">{{ r.attachment_name }}</a></td>
+        <td>
+          {% if r.available %}
+            <span class="badge ok">可用</span>
+            <div class="reason" style="color:var(--muted)">
+              有效来源（同号同字节）：
+              {% for s in r.available_sources %}
+                <code>#{{ s.message_id }}</code>（UID {{ s.uid }}，{{ s.disposition }}）{% if not loop.last %}、{% endif %}
+              {% endfor %}
+            </div>
+          {% else %}
+            <span class="badge bad">不可用</span>
+            <div class="reason">交付来源均已撤销，新下载将被拒绝</div>
+          {% endif %}
+          {% if r.revoked_sources %}
+            <div class="reason">已撤销来源：
+              {% for s in r.revoked_sources %}<code>#{{ s.message_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}
+            </div>
+          {% endif %}
+        </td>
+        <td>
+          {% if r.available %}
+            <a href="/api/reports/{{ r.id }}/attachment">{{ r.attachment_name }}</a>
+          {% else %}
+            <span class="badge bad" title="无有效来源，附件下载已关闭">不可下载</span>
+          {% endif %}
+        </td>
       </tr>
     {% else %}
-      <tr><td colspan="6" class="empty">暂无报告。</td></tr>
+      <tr><td colspan="7" class="empty">暂无报告。</td></tr>
     {% endfor %}
     </tbody>
   </table>
+  <p class="hint">可用性按已提交事务实时计算：至少一封<strong>未撤销的收讫邮件</strong>交付同报告号、同字节（SHA-256）附件时才可用；撤销不删除邮件原件、回执与报告历史。</p>
 </section>
 
 <section class="panel">

@@ -59,3 +59,12 @@ ul.reasons { margin: .3rem 0 0; padding-left: 1.1rem; color: var(--bad); font-si
 .filters a { color: var(--accent); text-decoration: none; padding: .15rem .5rem; border-radius: 4px; }
 .filters a.active { background: #e6eef8; font-weight: 600; }
 a { color: var(--accent); }
+
+.topnav { display: flex; gap: .5rem; margin-top: .7rem; }
+.topnav a { text-decoration: none; padding: .3rem .8rem; border: 1px solid var(--line); border-radius: 6px; background: #f6f8fa; font-size: .88rem; }
+.topnav a:hover { background: #e6eef8; }
+
+button.danger { background: var(--bad); }
+.revoke-form { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; }
+.reason-input { padding: .45rem .55rem; border: 1px solid var(--line); border-radius: 6px; font-size: .85rem; min-width: 13rem; }
+.reason-input:focus { outline: 2px solid #cfe0f3; border-color: var(--accent); }

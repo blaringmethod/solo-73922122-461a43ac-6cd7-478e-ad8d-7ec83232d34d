@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block content %}
+{% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+{% if error %}<div class="flash bad">错误：{{ error }}</div>{% endif %}
+
+<section class="cards">
+  <div class="card"><span>收讫邮件</span><strong>{{ stats.accepted }}</strong></div>
+  <div class="card warn"><span>来源撤销</span><strong>{{ stats.revocations }}</strong></div>
+  <div class="card"><span>入库报告</span><strong>{{ stats.reports }}</strong></div>
+  <div class="card warn"><span>不可用报告</span><strong>{{ stats.unavailable_reports }}</strong></div>
+</section>
+
+<section class="panel">
+  <h2>撤销一封收讫邮件的供数授权</h2>
+  <p class="hint">
+    选择一封<strong>已收讫</strong>邮件并填写撤销原因。撤销只收回授权：邮件原件、回执、交付记录与报告历史全部保留；
+    若某报告只由该邮件交付，报告将标记为<strong>不可用</strong>且新的附件下载被拒绝；
+    若另有未撤销的收讫邮件交付同号、同字节附件，报告保持可用。重复提交不会产生第二条撤销记录。
+  </p>
+  <table>
+    <thead><tr>
+      <th>#</th><th>时间</th><th>UID / UIDVALIDITY</th><th>主题</th>
+      <th>报告号</th><th>状态</th><th>原件 / 回执</th><th>撤销操作</th>
+    </tr></thead>
+    <tbody>
+    {% for m in messages %}
+      <tr class="{{ 'row-bad' if m.revoked else '' }}">
+        <td>{{ m.id }}</td>
+        <td class="nowrap">{{ m.created_at }}</td>
+        <td>{{ m.uid }} / {{ m.uidvalidity }}</td>
+        <td>{{ m.subject or "—" }}</td>
+        <td>{% for r in m.report_nos_list %}<code>{{ r }}</code> {% endfor %}</td>
+        <td>
+          <span class="badge ok">收讫</span>
+          {% if m.revoked %}
+            <span class="badge bad">已撤销</span>
+            <div class="reason">{{ m.revocation.reason }}</div>
+            <div class="reason" style="color:var(--muted)">{{ m.revocation.created_at }} · {{ m.revocation.revoked_by }}</div>
+          {% endif %}
+        </td>
+        <td class="nowrap">
+          <a href="/api/messages/{{ m.id }}/original">原件</a>
+          <a href="/api/messages/{{ m.id }}/receipt">回执</a>
+        </td>
+        <td>
+          {% if m.revoked %}
+            <span class="badge bad">授权已收回</span>
+          {% else %}
+            <form method="post" action="/actions/revoke" class="revoke-form"
+                  onsubmit="return confirm('确认撤销邮件 #{{ m.id }} 的供数授权？原件与回执会保留。');">
+              <input type="hidden" name="message_id" value="{{ m.id }}">
+              <input type="text" name="reason" maxlength="500" required
+                     placeholder="撤销原因（必填，≥2 字）" class="reason-input">
+              <button type="submit" class="danger">撤销授权</button>
+            </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="empty">暂无收讫邮件。先到<a href="/">采集仪表盘</a>采集邮件。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>撤销记录</h2>
+  <table>
+    <thead><tr><th>#</th><th>邮件</th><th>UID / UIDVALIDITY</th><th>主题</th><th>原因</th><th>操作人</th><th>实例</th><th>时间</th></tr></thead>
+    <tbody>
+    {% for rv in records %}
+      <tr>
+        <td>{{ rv.id }}</td>
+        <td><code>#{{ rv.message_id }}</code></td>
+        <td>{{ rv.uid }} / {{ rv.uidvalidity }}</td>
+        <td>{{ rv.subject or "—" }}</td>
+        <td>{{ rv.reason }}</td>
+        <td>{{ rv.revoked_by }}</td>
+        <td><code>{{ rv.instance }}</code></td>
+        <td class="nowrap">{{ rv.created_at }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="empty">暂无撤销记录。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>报告供数状态与实际可用来源</h2>
+  <table>
+    <thead><tr><th>报告号</th><th>样本号</th><th>原件 SHA-256</th><th>状态</th><th>实际可用来源</th><th>已撤销来源</th><th>附件</th></tr></thead>
+    <tbody>
+    {% for r in reports %}
+      <tr class="{{ 'row-bad' if not r.available else '' }}">
+        <td><code>{{ r.report_no }}</code></td>
+        <td>{{ r.sample_no }}</td>
+        <td class="mono">{{ r.attachment_sha256[:16] }}…</td>
+        <td>
+          {% if r.available %}<span class="badge ok">可用</span>
+          {% else %}<span class="badge bad">不可用</span>{% endif %}
+        </td>
+        <td>
+          {% for s in r.available_sources %}
+            <code>#{{ s.message_id }}</code>（UID {{ s.uid }}，{{ s.disposition }}）{% if not loop.last %}、{% endif %}
+          {% else %}<span class="reason">无</span>{% endfor %}
+        </td>
+        <td>
+          {% for s in r.revoked_sources %}
+            <code>#{{ s.message_id }}</code>{% if not loop.last %}、{% endif %}
+          {% else %}—{% endfor %}
+        </td>
+        <td>
+          {% if r.available %}
+            <a href="/api/reports/{{ r.id }}/attachment">{{ r.attachment_name }}</a>
+          {% else %}
+            <span class="badge bad" title="无有效来源，附件下载已关闭">不可下载</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="empty">暂无报告。</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

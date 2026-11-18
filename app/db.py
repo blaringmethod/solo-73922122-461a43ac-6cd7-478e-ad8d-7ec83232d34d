@@ -24,7 +24,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+class RevocationError(RuntimeError):
+    """A revocation request cannot be applied (bad target or state)."""
+
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def utcnow() -> str:
@@ -163,6 +171,21 @@ class Database:
                     UNIQUE (message_id, report_no)
                 );
 
+                -- A source revocation withdraws one received (accepted)
+                -- message's authorization to feed reports.  The original mail,
+                -- receipt and delivery rows are deliberately kept; only the
+                -- authorization changes.  UNIQUE(message_id) makes a repeated
+                -- submission idempotent: it can never add a second record.
+                CREATE TABLE IF NOT EXISTS revocation (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL UNIQUE
+                        REFERENCES message_record(id),
+                    reason TEXT NOT NULL,
+                    revoked_by TEXT NOT NULL,
+                    instance TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_message_created
                     ON message_record(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_message_mark
@@ -171,6 +194,10 @@ class Database:
                     ON report(account, mailbox, report_no);
                 CREATE INDEX IF NOT EXISTS idx_delivery_message
                     ON delivery(message_id);
+                CREATE INDEX IF NOT EXISTS idx_delivery_report
+                    ON delivery(report_no, attachment_sha256);
+                CREATE INDEX IF NOT EXISTS idx_revocation_message
+                    ON revocation(message_id);
                 CREATE INDEX IF NOT EXISTS idx_scan_started
                     ON scan_run(started_at DESC);
                 """
@@ -466,12 +493,23 @@ class Database:
                 "SELECT * FROM message_record WHERE id=?", (message_id,)
             ).fetchone()
 
-    def list_messages(self, limit: int = 100, mark_state: str | None = None) -> list[sqlite3.Row]:
+    def list_messages(
+        self,
+        limit: int = 100,
+        mark_state: str | None = None,
+        decision: str | None = None,
+    ) -> list[sqlite3.Row]:
         sql = "SELECT * FROM message_record"
+        clauses: list[str] = []
         params: list[Any] = []
         if mark_state:
-            sql += " WHERE mark_state=?"
+            clauses.append("mark_state=?")
             params.append(mark_state)
+        if decision:
+            clauses.append("decision=?")
+            params.append(decision)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
         params.append(limit)
         with self.connect() as conn:
@@ -547,6 +585,138 @@ class Database:
                     (utcnow(), message_id),
                 )
 
+    # ------------------------------------------------------------- revocation
+    def get_revocation(self, message_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM revocation WHERE message_id=?", (message_id,)
+            ).fetchone()
+
+    def list_revocations(self, limit: int = 100) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT rv.*, m.uidvalidity, m.uid, m.subject,
+                          m.report_nos, m.raw_sha256
+                   FROM revocation rv
+                   JOIN message_record m ON m.id = rv.message_id
+                   ORDER BY rv.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+    def revoke_message(
+        self,
+        message_id: int,
+        reason: str,
+        revoked_by: str,
+        instance: str,
+    ) -> dict[str, Any]:
+        """Revoke one accepted message's supply authorization.
+
+        All checks and the insert run in one ``BEGIN IMMEDIATE`` transaction,
+        so an interleaving collector commit is fully visible to the decision
+        (or fully waits behind it).  Availability is never cached: the
+        ``report``/``delivery``/``revocation`` tables are read at request time,
+        so the only state a download or the UI can observe is committed state.
+
+        Returns ``{"status": "revoked", ...}`` or ``{"status": "already"}``
+        for a duplicate submission.  Raises :class:`RevocationError` when the
+        message cannot be revoked; the transaction then rolls back and no
+        supply state changes.
+        """
+        with self.connect() as conn:
+            with transaction(conn):
+                message = conn.execute(
+                    "SELECT * FROM message_record WHERE id=?", (message_id,)
+                ).fetchone()
+                if message is None:
+                    raise RevocationError("邮件记录不存在", status_code=404)
+                if message["decision"] != "accepted":
+                    raise RevocationError("只有收讫邮件可以撤销；拒收邮件没有供数授权")
+                existing = conn.execute(
+                    "SELECT id FROM revocation WHERE message_id=?", (message_id,)
+                ).fetchone()
+                if existing is not None:
+                    # Idempotent: a repeated submit must not add a record or
+                    # change the supply state.
+                    return {"status": "already", "revocation_id": int(existing["id"])}
+                cur = conn.execute(
+                    """INSERT INTO revocation
+                       (message_id, reason, revoked_by, instance, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (message_id, reason, revoked_by, instance, utcnow()),
+                )
+                return {
+                    "status": "revoked",
+                    "revocation_id": int(cur.lastrowid),
+                    "message_id": message_id,
+                }
+
+    # ------------------------------------------------------------ availability
+    def report_availability(self, report_id: int) -> sqlite3.Row | None:
+        """Current committed availability of one report.
+
+        A report is available when at least one *not revoked* received message
+        still delivers an attachment with the same report number and the same
+        byte content (SHA-256).  Everything is derived inside a single read, so
+        interleaving with a collector transaction can only ever show a
+        before-commit or after-commit snapshot, never a mixed one.
+        """
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT r.id, r.report_no, r.attachment_sha256,
+                          r.attachment_name, r.attachment_path,
+                          EXISTS (
+                              SELECT 1
+                              FROM delivery d
+                              JOIN message_record m ON m.id = d.message_id
+                              LEFT JOIN revocation rv ON rv.message_id = m.id
+                              WHERE d.report_no = r.report_no
+                                AND d.attachment_sha256 = r.attachment_sha256
+                                AND m.decision = 'accepted'
+                                AND rv.id IS NULL
+                          ) AS available
+                   FROM report r WHERE r.id = ?""",
+                (report_id,),
+            ).fetchone()
+
+    def report_sources(self, report_no: str, attachment_sha256: str) -> list[sqlite3.Row]:
+        """Deliveries that currently authorize a report, with revocation state."""
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT m.id AS message_id, m.uidvalidity, m.uid, m.subject,
+                          m.from_addr, m.created_at AS message_created_at,
+                          d.attachment_sha256, d.attachment_name,
+                          d.disposition,
+                          rv.id AS revocation_id, rv.reason AS revocation_reason,
+                          rv.created_at AS revoked_at
+                   FROM delivery d
+                   JOIN message_record m ON m.id = d.message_id
+                   LEFT JOIN revocation rv ON rv.message_id = m.id
+                   WHERE d.report_no = ? AND d.attachment_sha256 = ?
+                   ORDER BY m.id""",
+                (report_no, attachment_sha256),
+            ).fetchall()
+
+    def list_report_views(self, limit: int = 200) -> list[sqlite3.Row]:
+        """Reports joined with their current committed availability flag."""
+        with self.connect() as conn:
+            return conn.execute(
+                """SELECT r.*,
+                          EXISTS (
+                              SELECT 1
+                              FROM delivery d
+                              JOIN message_record m ON m.id = d.message_id
+                              LEFT JOIN revocation rv ON rv.message_id = m.id
+                              WHERE d.report_no = r.report_no
+                                AND d.attachment_sha256 = r.attachment_sha256
+                                AND m.decision = 'accepted'
+                                AND rv.id IS NULL
+                          ) AS available
+                   FROM report r
+                   ORDER BY r.created_at DESC, r.id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
     # --------------------------------------------------------------- snapshot
     def stats(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -562,6 +732,19 @@ class Database:
                 "marked": one("SELECT COUNT(*) FROM message_record WHERE mark_state='marked'"),
                 "stale_marks": one("SELECT COUNT(*) FROM message_record WHERE mark_state='stale'"),
                 "reports": one("SELECT COUNT(*) FROM report"),
+                "revocations": one("SELECT COUNT(*) FROM revocation"),
+                "unavailable_reports": one(
+                    """SELECT COUNT(*) FROM report r
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM delivery d
+                           JOIN message_record m ON m.id = d.message_id
+                           LEFT JOIN revocation rv ON rv.message_id = m.id
+                           WHERE d.report_no = r.report_no
+                             AND d.attachment_sha256 = r.attachment_sha256
+                             AND m.decision = 'accepted'
+                             AND rv.id IS NULL
+                       )"""
+                ),
                 "scans": one("SELECT COUNT(*) FROM scan_run"),
             }
 
@@ -586,4 +769,4 @@ class Database:
             ).fetchone()
 
 
-__all__ = ["Database", "transaction", "utcnow"]
+__all__ = ["Database", "RevocationError", "transaction", "utcnow"]

@@ -137,5 +137,43 @@ rows=json.load(sys.stdin)
 for r in sorted(rows, key=lambda x: (x["uidvalidity"], x["uid"]))[-10:]:
     print(r["uidvalidity"], r["uid"], r["decision"], r["mark_state"], r["report_nos"], r["reason"] or "")'
 
+step "9. 来源撤销：撤销唯一来源 → 报告不可用、下载拒绝、原件与回执保留"
+deliver '{"subject":"演示-撤销件","attachments":[
+  {"filename":"DEMO-RV.csv","report_no":"DEMO-RV","sample_no":"S100","item":"ALT","value":"77"}]}'
+curl -fsS -X POST "$APP_A/api/scan" | json
+RV_MSG=$(curl -fsS "$APP_A/api/messages" | python3 -c 'import json,sys
+print([m["id"] for m in json.load(sys.stdin) if "DEMO-RV" in m["report_nos_list"]][0])')
+RV_REPORT=$(curl -fsS "$APP_A/api/reports" | python3 -c 'import json,sys
+print([r["id"] for r in json.load(sys.stdin) if r["report_no"]=="DEMO-RV"][0])')
+echo "撤销前：available=$(curl -fsS "$APP_A/api/reports/$RV_REPORT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["available"])')"
+curl -fsS -X POST "$APP_B/api/messages/$RV_MSG/revoke" -H 'Content-Type: application/json' \
+  -d '{"reason":"演示：检验邮件误投，撤销供数授权","revoked_by":"lab-operator"}' | json
+echo "撤销后下载（应为 403）："
+curl -s -o /dev/null -w "  attachment HTTP %{http_code}\n" "$APP_A/api/reports/$RV_REPORT/attachment"
+echo "原件与回执仍可下载（应为 200/200）："
+curl -s -o /dev/null -w "  original HTTP %{http_code}\n" "$APP_A/api/messages/$RV_MSG/original"
+curl -s -o /dev/null -w "  receipt  HTTP %{http_code}\n" "$APP_A/api/messages/$RV_MSG/receipt"
+
+step "9b. 重复撤销幂等：不新增撤销记录"
+curl -fsS -X POST "$APP_B/api/messages/$RV_MSG/revoke" -H 'Content-Type: application/json' \
+  -d '{"reason":"重复提交"}' | json
+curl -fsS "$APP_A/api/revocations" | python3 -c 'import json,sys
+rows=[r for r in json.load(sys.stdin) if r["message_id"]=='"$RV_MSG"']
+assert len(rows)==1, "duplicate revocation row!"
+print("该邮件撤销记录数:", len(rows), "| 原因保留为:", rows[0]["reason"])'
+
+step "10. 另一封未撤销收讫邮件交付同号同字节 → 报告恢复可用并显示实际来源"
+deliver '{"subject":"演示-撤销后补送同字节","attachments":[
+  {"filename":"DEMO-RV.csv","report_no":"DEMO-RV","sample_no":"S100","item":"ALT","value":"77"}]}'
+curl -fsS -X POST "$APP_A/api/scan" | json
+curl -fsS "$APP_A/api/reports/$RV_REPORT" | python3 -c 'import json,sys
+r=json.load(sys.stdin)
+assert r["available"] is True, r
+print("available=", r["available"])
+print("实际可用来源=", [(s["message_id"], s["disposition"]) for s in r["available_sources"]])
+print("已撤销来源=", [s["message_id"] for s in r["revoked_sources"]])'
+curl -s -o /dev/null -w "恢复后下载 HTTP %{http_code}（应为 200）\n" "$APP_A/api/reports/$RV_REPORT/attachment"
+echo "撤销网页：$APP_A/revocations （两个实例同库，web-b 同样可见）"
+
 echo
-echo "全部演示步骤完成。浏览器打开 $APP_A 或 $APP_B 查看页面。"
+echo "全部演示步骤完成。浏览器打开 $APP_A 或 $APP_B 查看页面，撤销页 /revocations。"
